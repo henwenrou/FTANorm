@@ -1,0 +1,9 @@
+# 数据集不记录
+data/abdominal/CHAOST2/processed/
+data/abdominal/SABSCT/processed/
+data/cardiac/processed/bSSFP/
+data/cardiac/processed/LGE
+
+
+logs/
+/
