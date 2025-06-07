@@ -1,9 +1,5 @@
 import argparse, os, sys, datetime, importlib
 os.environ['KMP_DUPLICATE_LIB_OK']='true'
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'true'
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-os.environ.setdefault("PYTHONHASHSEED", "42")
 import torch.optim
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -262,4 +258,3 @@ if __name__ == "__main__":
             torch.save({'model': model.state_dict()}, os.path.join(ckptdir, 'latest.pth'))
             print(f'End training with iteration {cur_iter}')
             break
-

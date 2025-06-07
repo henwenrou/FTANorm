@@ -322,4 +322,3 @@ def eval_list_wrapper(vol_list, nclass, label_name):
 
     print("Overall mean dice by domain {:06.5f}".format( error_dict['overall_by_domain'] ) )
     return error_dict, dsc_table, domain_names
-
