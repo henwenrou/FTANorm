@@ -128,7 +128,7 @@ class DataModuleFromConfig(torch.nn.Module):
         return DataLoader(self.datasets["test"], batch_size=self.batch_size,
                           num_workers=self.num_workers)
 
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 if __name__ == "__main__":
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
