@@ -2,7 +2,7 @@ import argparse, os, sys, datetime, importlib
 os.environ['KMP_DUPLICATE_LIB_OK']='true'
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-os.environ.setdefault("PYTHONHASHSEED", "42")
+os.environ.setdefault("PYTHONHASHSEED", "23")
 import torch.optim
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -65,7 +65,7 @@ def get_parser(**parser_kwargs):
         "-s",
         "--seed",
         type=int,
-        default=42,
+        default=23,
         help="seed for seed_everything",
     )
     parser.add_argument(
