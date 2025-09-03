@@ -4,12 +4,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import util.misc as utils
+from util.misc import MetricLogger
 import functools
 from tqdm import tqdm
 import torch.nn.functional as F
 from monai.metrics import compute_meandice
 from torch.autograd import Variable
 from dataloaders.saliency_balancing_fusion import get_SBF_map
+from util.context_injector import inject_global_context
+
 print = functools.partial(print, flush=True)
 
 def train_warm_up(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -48,53 +51,63 @@ def train_warm_up(model: torch.nn.Module, criterion: torch.nn.Module,
                 return cur_iteration
         metric_logger.synchronize_between_processes()
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, cur_iteration:int, max_iteration: int = -1, grad_scaler=None):
+def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch,
+                    max_norm=0, scaler=None,
+                    context_provider=None,
+                    boundary_loss=None,
+                    boundary_lambda: float = 0.0):
+
     model.train()
-    criterion.train()
+    metric_logger = MetricLogger(delimiter="  ")
+    header = f"Epoch: [{epoch}]"
+    print_freq = 20
 
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    for samples in metric_logger.log_every(data_loader, print_freq, header):
+        # 原仓库是 dict
+        images = samples['images'].to(device, non_blocking=True)
+        masks  = samples['labels'].to(device, non_blocking=True)
 
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+        # 注入上下文
+        ctx = context_provider(images) if context_provider is not None else None
+        inject_global_context(model, ctx)
 
-    for i, samples in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        for k, v in samples.items():
-            if isinstance(samples[k], torch.Tensor):
-                samples[k] = v.to(device)
-
-        img = samples['images']
-        lbl = samples['labels']
-
-        if grad_scaler is None:
-            pred = model(img)
-            loss_dict = criterion.get_loss(pred,lbl)
-            losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys())
-            optimizer.zero_grad()
-            losses.backward()
-            optimizer.step()
-        else:
+        if scaler is not None:
             with torch.cuda.amp.autocast():
-                pred = model(img)
-                loss_dict = criterion.get_loss(pred,lbl)
-                losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys())
-            optimizer.zero_grad()
-            grad_scaler.scale(losses).backward()
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
+                logits = model(images)
+                loss_dict = criterion.get_loss(logits, masks)
+                loss_seg = sum(loss_dict[k] * criterion.weight_dict[k]
+                               for k in loss_dict.keys() if k in criterion.weight_dict)
+                if boundary_loss is not None and boundary_lambda > 0:
+                    loss_bnd = boundary_loss(logits, masks)
+                    loss = loss_seg + boundary_lambda * loss_bnd
+                else:
+                    loss_bnd = torch.tensor(0.0, device=device)
+                    loss = loss_seg
+        else:
+            logits = model(images)
+            loss_dict = criterion.get_loss(logits, masks)
+            loss_seg = sum(loss_dict[k] * criterion.weight_dict[k]
+                           for k in loss_dict.keys() if k in criterion.weight_dict)
+            if boundary_loss is not None and boundary_lambda > 0:
+                loss_bnd = boundary_loss(logits, masks)
+                loss = loss_seg + boundary_lambda * loss_bnd
+            else:
+                loss_bnd = torch.tensor(0.0, device=device)
+                loss = loss_seg
 
-        metric_logger.update(**loss_dict)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        cur_iteration+=1
-        if cur_iteration>=max_iteration and max_iteration>0:
-            break
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return cur_iteration
-
+        metric_logger.update(loss=float(loss.item()),
+                             loss_seg=float(loss_seg.item()),
+                             loss_bnd=float(loss_bnd.item()))
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 def train_one_epoch_SBF(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -194,27 +207,26 @@ def train_one_epoch_SBF(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, data_loader: Iterable, device: torch.device):
+def evaluate(model, criterion, data_loader, device,
+             context_provider=None):  # NEW：验证时也可注入上下文（或设为 None 走回退仿射）
     model.eval()
-    def convert_to_one_hot(tensor,num_c):
-        return F.one_hot(tensor,num_c).permute((0,3,1,2))
-    dices=[]
-    for samples in data_loader:
-        for k, v in samples.items():
-            if isinstance(samples[k], torch.Tensor):
-                samples[k] = v.to(device)
-        img = samples['images']
-        lbl = samples['labels']
-        logits = model(img)
-        num_classes=logits.size(1)
-        pred=torch.argmax(logits,dim=1)
-        one_hot_pred=convert_to_one_hot(pred,num_classes)
-        one_hot_gt=convert_to_one_hot(lbl,num_classes)
-        dice=compute_meandice(one_hot_pred,one_hot_gt,include_background=False)
-        dices.append(dice.cpu().numpy())
-    dices=np.concatenate(dices,0)
-    dices=np.nanmean(dices,0)
-    return dices
+    metric_logger = MetricLogger(delimiter="  ")
+    header = "Test:"
+
+    for samples in metric_logger.log_every(data_loader, 50, header):
+        images = samples['images'].to(device, non_blocking=True)
+        masks  = samples['labels'].to(device, non_blocking=True)
+
+        ctx = context_provider(images) if context_provider is not None else None
+        inject_global_context(model, ctx)
+
+        logits = model(images)
+        loss_dict = criterion.get_loss(logits, masks)
+        loss = sum(loss_dict[k] * criterion.weight_dict[k]
+                   for k in loss_dict if k in criterion.weight_dict)
+        metric_logger.update(loss=float(loss.item()))
+
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 def prediction_wrapper(model, test_loader, epoch, label_name, mode = 'base', save_prediction = False):
     """

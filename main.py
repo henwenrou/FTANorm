@@ -6,11 +6,16 @@ os.environ.setdefault("PYTHONHASHSEED", "23")
 import torch.optim
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-from engine import train_warm_up,evaluate,train_one_epoch_SBF,train_one_epoch,prediction_wrapper
+from engine import train_warm_up,evaluate,train_one_epoch,train_one_epoch_SBF,prediction_wrapper
 from losses import SetCriterion
 import numpy as np
 import random
 from torch.optim import lr_scheduler
+
+from models.convert_bn_to_ftanorm import convert_bn_to_ftanorm
+from models.global_structure import GlobalStructureEncoder
+from losses.boundary_loss import BoundaryLoss
+
 
 def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
@@ -89,6 +94,7 @@ def instantiate_from_config(config):
         raise KeyError("Expected key `target` to instantiate.")
     return get_obj_from_str(config["target"])(**config.get("params", dict()))
 
+
 class DataModuleFromConfig(torch.nn.Module):
     def __init__(self, batch_size, train=None, validation=None, test=None,
                  num_workers=None):
@@ -134,20 +140,21 @@ if __name__ == "__main__":
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     sys.path.append(os.getcwd())
     parser = get_parser()
-    opt, unknown = parser.parse_known_args()
-    seed=seed_everything(opt.seed)
-    if opt.resume:
-        if not os.path.exists(opt.resume):
-            raise ValueError("Cannot find {}".format(opt.resume))
-    if opt.base:
-        cfg_fname = os.path.split(opt.base[0])[-1]
+    args, unknown = parser.parse_known_args()
+    opt = args
+    seed=seed_everything(args.seed)
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise ValueError("Cannot find {}".format(args.resume))
+    if args.base:
+        cfg_fname = os.path.split(args.base[0])[-1]
         cfg_name = os.path.splitext(cfg_fname)[0]
         name = "_" + cfg_name
     else:
         name=None
         raise ValueError('no config')
 
-    nowname = now +f'_seed{seed}'+ name + opt.postfix
+    nowname = now +f'_seed{seed}'+ name + args.postfix
     logdir = os.path.join("logs", nowname)
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
@@ -155,17 +162,39 @@ if __name__ == "__main__":
     for d in [logdir, cfgdir, ckptdir,visdir ]:
         os.makedirs(d, exist_ok=True)
 
-    configs = [OmegaConf.load(cfg) for cfg in opt.base]
+    configs = [OmegaConf.load(cfg) for cfg in args.base]
     cli = OmegaConf.from_dotlist(unknown)
     config = OmegaConf.merge(*configs, cli)
     OmegaConf.save(config,os.path.join(cfgdir, "{}-project.yaml".format(now)))
 
     model_config = config.pop("model", OmegaConf.create())
     optimizer_config = config.pop('optimizer', OmegaConf.create())
+    SBF_config = config.pop('saliency_balancing_fusion', OmegaConf.create())
 
-    SBF_config = config.pop('saliency_balancing_fusion',OmegaConf.create())
-
+    # 实例化模型（你之前注释掉了，必须恢复）
     model = instantiate_from_config(model_config)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    scaler = None  # 如需要 AMP 再启用 GradScaler
+    # 设备与混精
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    scaler = None  # 如需AMP可自行创建 torch.cuda.amp.GradScaler()
+    
+    context_dim = 64
+    boundary_lambda = 0.2
+    # 从配置拉 in_ch；没有就默认为 1
+    in_ch = int(OmegaConf.select(config, 'data.params.in_ch') or 1)
+    
+    model = convert_bn_to_ftanorm(model, context_dim=context_dim).to(device)
+    gse = GlobalStructureEncoder(in_ch=in_ch, context_dim=context_dim).to(device)
+    boundary_loss = BoundaryLoss().to(device)
+
+
+    def context_provider(images):
+        return gse(images)
+    
+    # 优化器变量统一用 opt（你上面就是 opt）
+    optimizer = opt  # 为了和 engine 形参一致，也可以直接把下方调用里的 optimizer 改成 opt
+
     if torch.cuda.is_available():
         model=model.cuda()
 
@@ -188,13 +217,15 @@ if __name__ == "__main__":
     criterion = SetCriterion()
 
     print('optimization parameters: ', opt_params)
-    opt = eval(optimizer_config['target'])(param_dicts, **opt_params)
+     # 把 GSE 参数也训练
+    param_dicts.append({"params": [p for p in gse.parameters() if p.requires_grad], "lr_scale": 1})
+    optimizer = eval(optimizer_config['target'])(param_dicts, **opt_params)
 
     if optimizer_config.lr_scheduler =='lambda':
         def lambda_rule(epoch):
             lr_l = 1.0 - max(0, epoch + 1 + 0 - 50) / float(optimizer_config.max_epoch-50 + 1)
             return lr_l
-        scheduler = lr_scheduler.LambdaLR(opt, lr_lambda=lambda_rule)
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_rule)
     else:
         scheduler=None
         print('We follow the SSDG learning rate schedule by default, you can add your own schedule by yourself')
@@ -230,16 +261,33 @@ if __name__ == "__main__":
     best_dice=0
     label_name=data.datasets["train"].all_label_names
     for cur_epoch in range(max_epoch):
+        iters_per_epoch = len(train_loader)
+        
         if SBF_config.usage:
-            cur_iter = train_one_epoch_SBF(model, criterion,train_loader,opt,torch.device('cuda'),cur_epoch,cur_iter, optimizer_config.max_iter, SBF_config, visdir)
+            # 用原来的 SBF 版本，它返回累计迭代数
+            cur_iter = train_one_epoch_SBF(
+                model, criterion, train_loader, optimizer, device,
+                cur_epoch, cur_iter,
+                max_iteration=optimizer_config.max_iter,
+                config=SBF_config, visdir=visdir
+            )
         else:
-            cur_iter = train_one_epoch(model, criterion, train_loader, opt, torch.device('cuda'), cur_epoch, cur_iter, optimizer_config.max_iter)
+            _stats = train_one_epoch(
+                model, criterion, train_loader, optimizer, device, cur_epoch,
+                max_norm=0, scaler=scaler,
+                context_provider=context_provider,
+                boundary_loss=boundary_loss, boundary_lambda=boundary_lambda,
+            )
+            cur_iter += iters_per_epoch
         if scheduler is not None:
             scheduler.step()
 
         # Save Bset model on val
-        if (cur_epoch+1)%100==0:
-            cur_dice = evaluate(model, val_loader, torch.device('cuda'))
+        if (cur_epoch+1)%3==0:
+            cur_dice = evaluate(
+    model, criterion, val_loader, device,
+    context_provider=context_provider,  # 或传 None 走回退仿射
+)
             if np.mean(cur_dice)>best_dice:
                 best_dice=np.mean(cur_dice)
                 for f in os.listdir(ckptdir):
@@ -252,6 +300,18 @@ if __name__ == "__main__":
                 str+=f'Class {i}: {d}, '
             str+=f'Validation DICE {np.mean(cur_dice)}/{best_dice}'
             print(str)
+
+        if (cur_epoch+1) % 3 == 0:
+            _, dsc_table, err, domains = prediction_wrapper(
+                model, val_loader, cur_epoch, label_name, mode='val', save_prediction=False)
+            cur_dice = float(err['overall'])  # 使用 overall
+            if cur_dice > best_dice:
+                best_dice = cur_dice
+                for f in os.listdir(ckptdir):
+                    if 'val' in f: os.remove(os.path.join(ckptdir, f))
+                torch.save({'model': model.state_dict()},
+                           os.path.join(ckptdir, f'val_best_epoch_{cur_epoch}.pth'))
+            print(f"Epoch [{cur_epoch}]  Val overall Dice {cur_dice:.4f} / best {best_dice:.4f}")
 
         # Save latest model
         if (cur_epoch+1)%50==0:
