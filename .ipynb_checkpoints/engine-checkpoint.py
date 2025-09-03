@@ -1,3 +1,4 @@
+# engine.py
 from typing import Iterable
 import os
 import matplotlib.pyplot as plt
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 from monai.metrics import compute_meandice
 from torch.autograd import Variable
 from dataloaders.saliency_balancing_fusion import get_SBF_map
-from util.context_injector import inject_global_context
+from utils.context_injector import inject_global_context, clear_global_context
 
 print = functools.partial(print, flush=True)
 
@@ -110,12 +111,14 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-def train_one_epoch_SBF(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, cur_iteration:int, max_iteration: int = -1,config=None,visdir=None):
+def train_one_epoch_SBF(model, criterion, data_loader, optimizer, device,
+                        epoch, cur_iteration, max_iteration=-1, config=None, visdir=None,
+                        context_provider=None):
+
     model.train()
     criterion.train()
-
+    clear_global_context(model)  # 避免沿用上次 ctx
+    
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
 
@@ -137,6 +140,10 @@ def train_one_epoch_SBF(model: torch.nn.Module, criterion: torch.nn.Module,
             visual_dict['GT']=lbl.detach().cpu().numpy()[0]
         else:
             visual_dict=None
+            
+        if context_provider is not None:
+            ctx = context_provider(GLA_img)
+            inject_global_context(model, ctx)
 
         input_var = Variable(GLA_img, requires_grad=True)
 
@@ -160,7 +167,10 @@ def train_one_epoch_SBF(model: torch.nn.Module, criterion: torch.nn.Module,
         mixed_img = GLA_img.detach() * saliency + LLA_img * (1 - saliency)
         if visual_dict is not None:
             visual_dict['SBF']= mixed_img.detach().cpu().numpy()[0,0]
-
+            
+        if context_provider is not None:
+            ctx2 = context_provider(mixed_img)
+            inject_global_context(model, ctx2)
         aug_var = Variable(mixed_img, requires_grad=True)
         aug_logits = model(aug_var)
         aug_loss_dict = criterion.get_loss(aug_logits, lbl)
@@ -227,59 +237,92 @@ def evaluate(model, criterion, data_loader, device,
         metric_logger.update(loss=float(loss.item()))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-def prediction_wrapper(model, test_loader, epoch, label_name, mode = 'base', save_prediction = False):
-    """
-    A wrapper for the ease of evaluation
-    Args:
-        model:          Module The network to evalute on
-        test_loader:    DataLoader Dataloader for the dataset to test
-        mode:           str Adding a note for the saved testing results
-    """
+    
+@torch.no_grad()
+def prediction_wrapper(model, test_loader, epoch, label_name, mode='base', save_prediction=False):
     model.eval()
-    with torch.no_grad():
-        out_prediction_list = {} # a buffer for saving results
-        # recomp_img_list = []
-        for idx, batch in tqdm(enumerate(test_loader), total = len(test_loader)):
-            if batch['is_start']:
-                slice_idx = 0
+    device = next(model.parameters()).device
 
-                scan_id_full = str(batch['scan_id'][0])
-                out_prediction_list[scan_id_full] = {}
+    import torch
+    def _as_bool(x):  # 接受 bool/int/str/0-d张量
+        if isinstance(x, bool): return x
+        if isinstance(x, (int, float)): return bool(x)
+        if isinstance(x, str): return x.lower() in ('true','1','t','y','yes')
+        if torch.is_tensor(x): return bool(x.item())
+        return bool(x)
 
-                nframe = batch['nframe']
-                nb, nc, nx, ny = batch['images'].shape
-                curr_pred = torch.Tensor(np.zeros( [ nframe,  nx, ny]  )).cuda() # nb/nz, nc, nx, ny
-                curr_gth = torch.Tensor(np.zeros( [nframe,  nx, ny]  )).cuda()
-                curr_img = np.zeros( [nx, ny, nframe]  )
+    def _as_int(x):
+        if isinstance(x, (int, float)): return int(x)
+        if torch.is_tensor(x): return int(x.item())
+        return int(x)
 
-            assert batch['labels'].shape[0] == 1 # enforce a batchsize of 1
+    out_prediction_list, state = {}, {}
 
-            img = batch['images'].cuda()
-            gth = batch['labels'].cuda()
+    from tqdm import tqdm
+    for batch in tqdm(test_loader, total=len(test_loader)):
+        imgs   = batch['images'].to(device)          # [B,C,H,W]
+        gths   = batch['labels'].to(device)          # [B,1,H,W] 或 [B,H,W]
+        sids   = batch['scan_id']                    # list[str] 或张量
+        nfs    = batch['nframe']                     # list[int]/张量或标量
+        is_st  = batch.get('is_start', None)         # [B] 或缺省
+        is_ed  = batch.get('is_end', None)           # [B] 或缺省
 
-            pred = model(img)
-            pred=torch.argmax(pred,1)
-            curr_pred[slice_idx, ...]   = pred[0, ...] # nb (1), nc, nx, ny
-            curr_gth[slice_idx, ...]    = gth[0, ...]
-            curr_img[:,:,slice_idx] = batch['images'][0, 0,...].numpy()
-            slice_idx += 1
+        B, _, H, W = imgs.shape
+        for b in range(B):
+            # 逐样本取值
+            sid = sids[b] if isinstance(sids, (list, tuple)) else (sids[b] if torch.is_tensor(sids) else sids)
+            sid = str(sid)
+            nf_b = nfs[b] if isinstance(nfs, (list, tuple)) else (nfs[b] if torch.is_tensor(nfs) and nfs.dim()==1 else nfs)
+            nf_b = _as_int(nf_b)
+            st_b = True if is_st is None else _as_bool(is_st[b] if isinstance(is_st,(list,tuple)) or (torch.is_tensor(is_st) and is_st.dim()==1) else is_st)
+            ed_b = False if is_ed is None else _as_bool(is_ed[b] if isinstance(is_ed,(list,tuple)) or (torch.is_tensor(is_ed) and is_ed.dim()==1) else is_ed)
 
-            if batch['is_end']:
-                out_prediction_list[scan_id_full]['pred'] = curr_pred
-                out_prediction_list[scan_id_full]['gth'] = curr_gth
-                # if opt.phase == 'test':
-                #     recomp_img_list.append(curr_img)
+            # 初始化该 scan
+            if st_b and sid not in state:
+                state[sid] = {
+                    'slice_idx': 0,
+                    'pred': torch.zeros((nf_b, H, W), device=device),
+                    'gth' : torch.zeros((nf_b, H, W), device=device)
+                }
+                out_prediction_list.setdefault(sid, {})
 
-        print("Epoch {} test result on mode {} segmentation are shown as follows:".format(epoch, mode))
-        error_dict, dsc_table, domain_names = eval_list_wrapper(out_prediction_list, len(label_name),label_name)
-        error_dict["mode"] = mode
-        if not save_prediction: # to save memory
-            del out_prediction_list
-            out_prediction_list = []
-        torch.cuda.empty_cache()
+            # 前向
+            x = imgs[b:b+1]
+            y = gths[b:b+1]
+            logit = model(x)
+            pred = torch.argmax(logit, dim=1)                 # [1,H,W]
+            y2d  = y[:,0] if y.dim()==4 and y.size(1)==1 else y.squeeze(0) if y.dim()==3 else y
+            y2d  = y2d.long()
 
+            st = state[sid]
+            idx = st['slice_idx']
+            # 防御：若 nf_b 低估，扩容
+            if idx >= st['pred'].size(0):
+                new_n = max(idx+1, st['pred'].size(0)*2)
+                st['pred'] = torch.cat([st['pred'], torch.zeros((new_n-st['pred'].size(0), H, W), device=device)], 0)
+                st['gth']  = torch.cat([st['gth'],  torch.zeros((new_n-st['gth'].size(0),  H, W), device=device)], 0)
+
+            st['pred'][idx] = pred[0]
+            st['gth'][idx]  = y2d if y2d.dim()==2 else y2d[0]
+            st['slice_idx'] = idx + 1
+
+            if ed_b:
+                used = st['slice_idx']
+                out_prediction_list[sid]['pred'] = st['pred'][:used]
+                out_prediction_list[sid]['gth']  = st['gth'][:used]
+                del state[sid]
+
+    print(f"Epoch {epoch} test result on mode {mode} segmentation are shown as follows:")
+    error_dict, dsc_table, domain_names = eval_list_wrapper(out_prediction_list, len(label_name), label_name)
+    error_dict["mode"] = mode
+    if not save_prediction:
+        del out_prediction_list
+        out_prediction_list = []
+    torch.cuda.empty_cache()
+    
     return out_prediction_list, dsc_table, error_dict, domain_names
+
+    
 
 def eval_list_wrapper(vol_list, nclass, label_name):
     """

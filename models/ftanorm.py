@@ -1,28 +1,4 @@
-# README（放到仓库根目录即可）
-# 目标
-# 在不大改 SLAug 代码结构的前提下，引入 FTANorm（条件归一化）与 Global-Structure Encoder（全局结构向量），
-# 通过“BN→FTANorm”转换器和“上下文注入器”完成端到端训练。可选加入边界/形状一致性正则。
-#
-# 用法概览
-# 1) 将本目录下的 `models/` 与 `utils/` 合并进你的 SLAug 仓库（保持相对路径）。
-# 2) 在构建原模型后，调用 convert_bn_to_ftanorm(model, context_dim=64)。
-# 3) 初始化 GlobalStructureEncoder(in_ch=1 或 3)。
-# 4) 训练循环中：
-#       ctx = gse(images)                      # [B, context_dim]
-#       inject_global_context(model, ctx)
-#       logits = model(images)
-#       loss = seg_loss(logits, masks) + λ * boundary_loss(logits, masks)
-# 5) 推理时无需上下文注入，FTANorm 自动回退到其可学习仿射参数。
-#
-# 兼容性
-# - 仅依赖 PyTorch>=1.10，无第三方库。
-# - 不修改原 forward 签名；上下文通过属性注入。
-# - DataParallel 和 DDP 可用（上下文注入发生在 forward 前）。
 
-
-# ==============================
-# file: models/ftanorm.py
-# ==============================
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -67,19 +43,17 @@ class FTANorm2d(nn.Module):
     def set_context(self, ctx: Optional[torch.Tensor]):
         self._gs_context = ctx
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         y = self.inorm(x)
         c = self._gs_context
+        # 形状不匹配则忽略旧 ctx
+        if c is not None and (c.dim()!=2 or c.size(0)!=x.size(0)):
+            c = None
         if c is not None:
-            # c: [B, d] -> params: [B, 2C]
             params = self.cond(c)
             gamma, beta = params.chunk(2, dim=1)
-            # 归一化尺度，稳定训练
-            gamma = torch.tanh(gamma)
-            beta = torch.tanh(beta)
-            gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # [B,C,1,1]
-            beta = beta.unsqueeze(-1).unsqueeze(-1)
-            # 广播到批次
+            gamma = torch.tanh(gamma).unsqueeze(-1).unsqueeze(-1)
+            beta  = torch.tanh(beta ).unsqueeze(-1).unsqueeze(-1)
             y = y * (1.0 + gamma) + beta
         elif self.affine_fallback:
             y = y * self.gamma0 + self.beta0

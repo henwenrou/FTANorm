@@ -1,3 +1,4 @@
+# main.py
 import argparse, os, sys, datetime, importlib
 os.environ['KMP_DUPLICATE_LIB_OK']='true'
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -264,12 +265,12 @@ if __name__ == "__main__":
         iters_per_epoch = len(train_loader)
         
         if SBF_config.usage:
-            # 用原来的 SBF 版本，它返回累计迭代数
             cur_iter = train_one_epoch_SBF(
                 model, criterion, train_loader, optimizer, device,
                 cur_epoch, cur_iter,
                 max_iteration=optimizer_config.max_iter,
-                config=SBF_config, visdir=visdir
+                config=SBF_config, visdir=visdir,
+                context_provider=context_provider,
             )
         else:
             _stats = train_one_epoch(
@@ -283,23 +284,10 @@ if __name__ == "__main__":
             scheduler.step()
 
         # Save Bset model on val
-        if (cur_epoch+1)%3==0:
-            cur_dice = evaluate(
-    model, criterion, val_loader, device,
-    context_provider=context_provider,  # 或传 None 走回退仿射
-)
-            if np.mean(cur_dice)>best_dice:
-                best_dice=np.mean(cur_dice)
-                for f in os.listdir(ckptdir):
-                    if 'val' in f:
-                        os.remove(os.path.join(ckptdir,f))
-                torch.save({'model': model.state_dict()}, os.path.join(ckptdir,f'val_best_epoch_{cur_epoch}.pth'))
-
-            str=f'Epoch [{cur_epoch}]   '
-            for i,d in enumerate(cur_dice):
-                str+=f'Class {i}: {d}, '
-            str+=f'Validation DICE {np.mean(cur_dice)}/{best_dice}'
-            print(str)
+        if (cur_epoch+1) % 3 == 0:
+            val_log = evaluate(model, criterion, val_loader, device,
+                               context_provider=context_provider)
+            print(f"Epoch [{cur_epoch}]  val_loss: {val_log['loss']:.4f}")
 
         if (cur_epoch+1) % 3 == 0:
             _, dsc_table, err, domains = prediction_wrapper(
