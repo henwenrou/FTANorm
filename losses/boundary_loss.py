@@ -24,30 +24,29 @@ class BoundaryLoss(nn.Module):
         g = torch.sqrt(gx * gx + gy * gy + 1e-6)
         return g
 
+    def _ensure_onehot(self, masks: torch.Tensor, C: int) -> torch.Tensor:
+        # masks: [B,H,W] (long) or [B,1,H,W] or [B,C,H,W]
+        if masks.dim() == 3:
+            return F.one_hot(masks.long(), num_classes=C).permute(0,3,1,2).float()
+        if masks.dim() == 4 and masks.size(1) == 1:
+            # 二值前景（0/1）
+            bg = (masks <= 0).float()
+            fg = (masks > 0).float()
+            return torch.cat([bg, fg], dim=1)
+        return masks.float()  # [B,C,H,W]
+
+
     def forward(self, logits: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        # 多类情况下仅对前景聚合，也可以对每类求和
-        probs = torch.softmax(logits, dim=1)
-        if probs.size(1) > 1:
-            probs_fg = probs[:, 1:, ...].sum(dim=1, keepdim=True)
-        else:
-            probs_fg = torch.sigmoid(logits)
+        B, C, H, W = logits.shape
+        probs = torch.softmax(logits, dim=1) if C > 1 else torch.sigmoid(logits)
+        if C == 1:
+            probs = torch.cat([1 - probs, probs], dim=1); C = 2
+        masks_1h = self._ensure_onehot(masks, C)
 
-        
-        # 统一标签形状到 [B,1,H,W]
-        if masks.dim() == 3:                           # [B,H,W]  整型标签
-            masks_fg = (masks > 0).float().unsqueeze(1)
-        elif masks.dim() == 4 and masks.size(1) == 1:  # [B,1,H,W]  二值/概率
-            masks_fg = (masks > 0).float()
-        elif masks.dim() == 4:                         # [B,C,H,W]  one-hot 或 logits式标签
-            masks_fg = (masks[:, 1:, ...] > 0).float().sum(dim=1, keepdim=True).clamp(0, 1)
-        else:
-            raise ValueError(f"Unexpected masks shape {masks.shape}")
-
-        gp = self._grad_mag(probs_fg)
-        gm = self._grad_mag(masks_fg)
-        loss = (gp - gm).abs()
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss
+        # 忽略背景，逐类边界一致性求平均
+        losses = []
+        for c in range(1, C):
+            gp = self._grad_mag(probs[:, c:c+1])
+            gm = self._grad_mag(masks_1h[:, c:c+1])
+            losses.append((gp - gm).abs().mean())
+        return torch.stack(losses).mean() if losses else torch.tensor(0., device=logits.device)

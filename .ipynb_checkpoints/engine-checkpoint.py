@@ -113,7 +113,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch,
 
 def train_one_epoch_SBF(model, criterion, data_loader, optimizer, device,
                         epoch, cur_iteration, max_iteration=-1, config=None, visdir=None,
-                        context_provider=None):
+                        context_provider=None, boundary_loss=None, boundary_lambda: float=0.0):
 
     model.train()
     criterion.train()
@@ -151,6 +151,9 @@ def train_one_epoch_SBF(model, criterion, data_loader, optimizer, device,
         logits = model(input_var)
         loss_dict = criterion.get_loss(logits, lbl)
         losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
+        if boundary_loss is not None and boundary_lambda > 0:
+            loss_bnd = boundary_loss(logits, lbl)
+            losses = losses + boundary_lambda * loss_bnd
         losses.backward(retain_graph=True)
 
         # saliency
@@ -158,6 +161,7 @@ def train_one_epoch_SBF(model, criterion, data_loader, optimizer, device,
 
         saliency=get_SBF_map(gradient,config.grid_size)
 
+        mixed_img = GLA_img.detach() * saliency + LLA_img * (1 - saliency)
         if visual_dict is not None:
             visual_dict['GLA_pred']=torch.argmax(logits,1).cpu().numpy()[0]
 
@@ -171,10 +175,19 @@ def train_one_epoch_SBF(model, criterion, data_loader, optimizer, device,
         if context_provider is not None:
             ctx2 = context_provider(mixed_img)
             inject_global_context(model, ctx2)
-        aug_var = Variable(mixed_img, requires_grad=True)
+            
+        aug_var = Variable(mixed_img, requires_grad=False)  # 这里不再需要二次反传 saliency
+        if context_provider is not None:
+            ctx_sbf = context_provider(mixed_img)
+            inject_global_context(model, ctx_sbf)
+
         aug_logits = model(aug_var)
         aug_loss_dict = criterion.get_loss(aug_logits, lbl)
         aug_losses = sum(aug_loss_dict[k] * criterion.weight_dict[k] for k in aug_loss_dict.keys() if k in criterion.weight_dict)
+
+        if boundary_loss is not None and boundary_lambda > 0:
+            aug_loss_bnd = boundary_loss(aug_logits, lbl)
+            aug_losses = aug_losses + boundary_lambda * aug_loss_bnd
 
         aug_losses.backward()
 
@@ -188,7 +201,9 @@ def train_one_epoch_SBF(model, criterion, data_loader, optimizer, device,
             if k not in criterion.weight_dict:continue
             all_loss_dict[k]=loss_dict[k]
             all_loss_dict[k+'_aug']=aug_loss_dict[k]
-
+        if boundary_loss is not None and boundary_lambda > 0:
+            all_loss_dict['bnd'] = loss_bnd.detach()
+            all_loss_dict['bnd_aug'] = aug_loss_bnd.detach()
         metric_logger.update(**all_loss_dict)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
