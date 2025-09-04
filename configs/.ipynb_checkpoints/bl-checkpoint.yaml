@@ -11,7 +11,7 @@ optimizer:
   target: torch.optim.Adam
   learning_rate: 3e-4
   weight_decay: 3e-5
-  max_epoch: 10
+  max_epoch: 2000
   max_iter: -1
   warmup_iter: -1
   lr_scheduler: lambda

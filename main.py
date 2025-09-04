@@ -283,13 +283,7 @@ if __name__ == "__main__":
         if scheduler is not None:
             scheduler.step()
 
-        # Save Bset model on val
-        if (cur_epoch+1) % 3 == 0:
-            val_log = evaluate(model, criterion, val_loader, device,
-                               context_provider=context_provider)
-            print(f"Epoch [{cur_epoch}]  val_loss: {val_log['loss']:.4f}")
-
-        if (cur_epoch+1) % 3 == 0:
+        if (cur_epoch+1) % 100 == 0:
             _, dsc_table, err, domains = prediction_wrapper(
                 model, val_loader, cur_epoch, label_name, mode='val', save_prediction=False)
             cur_dice = float(err['overall'])  # 使用 overall
