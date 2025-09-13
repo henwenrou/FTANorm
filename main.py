@@ -16,7 +16,8 @@ from torch.optim import lr_scheduler
 from models.convert_bn_to_ftanorm import convert_bn_to_ftanorm
 from models.global_structure import GlobalStructureEncoder
 from losses.boundary_loss import BoundaryLoss
-
+encoder = GlobalStructureEncoder(in_ch=model_input_channels, context_dim=64).to(device)
+encoder.eval()
 
 def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
@@ -181,7 +182,7 @@ if __name__ == "__main__":
     scaler = None  # 如需AMP可自行创建 torch.cuda.amp.GradScaler()
     
     context_dim = 64
-    boundary_lambda = 0.2
+    boundary_lambda = 0.0
     # 从配置拉 in_ch；没有就默认为 1
     in_ch = int(OmegaConf.select(config, 'data.params.in_ch') or 1)
     
@@ -198,6 +199,8 @@ if __name__ == "__main__":
 
     if torch.cuda.is_available():
         model=model.cuda()
+        model_input_channels = int(getattr(model_config.params, 'in_channels', 1))
+        context_provider = None
 
     if getattr(model_config.params, 'base_learning_rate') :
         bs, base_lr = config.data.params.batch_size, optimizer_config.base_learning_rate
@@ -257,7 +260,7 @@ if __name__ == "__main__":
 
     if getattr(optimizer_config, 'warmup_iter'):
         if optimizer_config.warmup_iter>0:
-            train_warm_up(model, criterion, train_loader, opt, torch.device('cuda'), lr, optimizer_config.warmup_iter)
+            train_warm_up(model, criterion, train_loader, optimizer, torch.device('cuda'), lr, optimizer_config.warmup_iter)
     cur_iter=0
     best_dice=0
     label_name=data.datasets["train"].all_label_names
@@ -272,14 +275,19 @@ if __name__ == "__main__":
                 config=SBF_config, visdir=visdir,
                 context_provider=context_provider,
             )
+
+        # else:
+        #     _stats = train_one_epoch(
+        #         model, criterion, train_loader, optimizer, device, cur_epoch,
+        #         max_norm=0, scaler=scaler,
+        #         context_provider=context_provider,
+        #         boundary_loss=boundary_loss, boundary_lambda=boundary_lambda,
+        #     )
+        #     cur_iter += iters_per_epoch
         else:
-            _stats = train_one_epoch(
-                model, criterion, train_loader, optimizer, device, cur_epoch,
-                max_norm=0, scaler=scaler,
-                context_provider=context_provider,
-                boundary_loss=boundary_loss, boundary_lambda=boundary_lambda,
-            )
-            cur_iter += iters_per_epoch
+            cur_iter = train_one_epoch(model, criterion, train_loader, opt, torch.device('cuda'),
+                               cur_epoch, max_norm=0, scaler=None,
+                               context_provider=context_provider)
         if scheduler is not None:
             scheduler.step()
 

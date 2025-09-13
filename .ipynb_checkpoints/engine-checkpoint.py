@@ -13,9 +13,19 @@ from monai.metrics import compute_meandice
 from torch.autograd import Variable
 from dataloaders.saliency_balancing_fusion import get_SBF_map
 from utils.context_injector import inject_global_context, clear_global_context
+from models.ftanorm import FTANorm2d
 
 print = functools.partial(print, flush=True)
 
+# 通用：安全注入
+def _maybe_set_ctx(model, context_provider, x):
+    if context_provider is None:
+        inject_global_context(model, None)
+        return
+    with torch.no_grad():
+        ctx = context_provider(x)   # shape [N, d]
+    inject_global_context(model, ctx)
+    
 def train_warm_up(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, learning_rate:float, warmup_iteration: int = 1500):
@@ -63,51 +73,42 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch,
     header = f"Epoch: [{epoch}]"
     print_freq = 20
 
+
     for samples in metric_logger.log_every(data_loader, print_freq, header):
-        # 原仓库是 dict
         images = samples['images'].to(device, non_blocking=True)
         masks  = samples['labels'].to(device, non_blocking=True)
 
-        # 注入上下文
-        ctx = context_provider(images) if context_provider is not None else None
-        inject_global_context(model, ctx)
-
-        if scaler is not None:
-            with torch.cuda.amp.autocast():
+        try:
+            # —— 本 batch 开始
+            with torch.no_grad():
+                ctx = context_provider(images) if context_provider else None
+            inject_global_context(model, ctx)
+    
+            optimizer.zero_grad(set_to_none=True)
+    
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    logits = model(images)
+                    loss_dict = criterion.get_loss(logits, masks)
+                    loss_seg = sum(loss_dict[k]*criterion.weight_dict[k] for k in loss_dict if k in criterion.weight_dict)
+                    loss_bnd = boundary_loss(logits, masks) if (boundary_loss and boundary_lambda>0) else torch.tensor(0.0, device=device)
+                    loss = loss_seg + boundary_lambda*loss_bnd
+                scaler.scale(loss).backward()
+                scaler.step(optimizer); scaler.update()
+            else:
                 logits = model(images)
                 loss_dict = criterion.get_loss(logits, masks)
-                loss_seg = sum(loss_dict[k] * criterion.weight_dict[k]
-                               for k in loss_dict.keys() if k in criterion.weight_dict)
-                if boundary_loss is not None and boundary_lambda > 0:
-                    loss_bnd = boundary_loss(logits, masks)
-                    loss = loss_seg + boundary_lambda * loss_bnd
-                else:
-                    loss_bnd = torch.tensor(0.0, device=device)
-                    loss = loss_seg
-        else:
-            logits = model(images)
-            loss_dict = criterion.get_loss(logits, masks)
-            loss_seg = sum(loss_dict[k] * criterion.weight_dict[k]
-                           for k in loss_dict.keys() if k in criterion.weight_dict)
-            if boundary_loss is not None and boundary_lambda > 0:
-                loss_bnd = boundary_loss(logits, masks)
-                loss = loss_seg + boundary_lambda * loss_bnd
-            else:
-                loss_bnd = torch.tensor(0.0, device=device)
-                loss = loss_seg
-
-        optimizer.zero_grad(set_to_none=True)
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
-
-        metric_logger.update(loss=float(loss.item()),
-                             loss_seg=float(loss_seg.item()),
-                             loss_bnd=float(loss_bnd.item()))
+                loss_seg = sum(loss_dict[k]*criterion.weight_dict[k] for k in loss_dict if k in criterion.weight_dict)
+                loss_bnd = boundary_loss(logits, masks) if (boundary_loss and boundary_lambda>0) else torch.tensor(0.0, device=device)
+                loss = loss_seg + boundary_lambda*loss_bnd
+                loss.backward(); optimizer.step()
+    
+            metric_logger.update(loss=float(loss.item()),
+                                 loss_seg=float(loss_seg.item()),
+                                 loss_bnd=float(loss_bnd.item()))
+            # —— 本 batch 结束
+        finally:
+            clear_global_context(model)   # 保证清空
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -126,110 +127,85 @@ def train_one_epoch_SBF(model, criterion, data_loader, optimizer, device,
     print_freq = 10
     visual_freq = 500
     for i, samples in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        for k, v in samples.items():
-            if isinstance(samples[k], torch.Tensor):
-                samples[k] = v.to(device)
+        for k, v in list(samples.items()):
+            if torch.is_tensor(v): samples[k] = v.to(device, non_blocking=True)
+        GLA_img, LLA_img, lbl = samples['images'], samples['aug_images'], samples['labels']
 
-        GLA_img = samples['images']
-        LLA_img = samples['aug_images']
-        lbl = samples['labels']
-        if cur_iteration % visual_freq == 0:
-            visual_dict={}
-            visual_dict['GLA']=GLA_img.detach().cpu().numpy()[0,0]
-            visual_dict['LLA']=LLA_img.detach().cpu().numpy()[0,0]
-            visual_dict['GT']=lbl.detach().cpu().numpy()[0]
-        else:
-            visual_dict=None
-            
-        if context_provider is not None:
-            ctx = context_provider(GLA_img)
+        try:
+            # —— 1) GLA 路径：需要梯度图
+            with torch.no_grad():
+                ctx = context_provider(GLA_img) if context_provider else None
             inject_global_context(model, ctx)
 
-        input_var = Variable(GLA_img, requires_grad=True)
+            input_img = GLA_img.requires_grad_(True)
+            optimizer.zero_grad(set_to_none=True)
 
-        optimizer.zero_grad()
-        logits = model(input_var)
-        loss_dict = criterion.get_loss(logits, lbl)
-        losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
-        if boundary_loss is not None and boundary_lambda > 0:
-            loss_bnd = boundary_loss(logits, lbl)
-            losses = losses + boundary_lambda * loss_bnd
-        losses.backward(retain_graph=True)
+            def _bnd(logits, y):
+                if boundary_loss and boundary_lambda > 0:
+                    return boundary_lambda * boundary_loss(logits, y)
+                return torch.tensor(0.0, device=device)
 
-        # saliency
-        gradient = torch.sqrt(torch.mean(input_var.grad ** 2, dim=1, keepdim=True)).detach()
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    logits = model(input_img)
+                    loss_dict = criterion.get_loss(logits, lbl)
+                    loss_main = sum(loss_dict[k]*criterion.weight_dict[k] for k in loss_dict if k in criterion.weight_dict)
+                    loss_bnd = _bnd(logits, lbl)
+                    loss1 = loss_main + loss_bnd
+                scaler.scale(loss1).backward(retain_graph=True)
+            else:
+                logits = model(input_img)
+                loss_dict = criterion.get_loss(logits, lbl)
+                loss_main = sum(loss_dict[k]*criterion.weight_dict[k] for k in loss_dict if k in criterion.weight_dict)
+                loss_bnd = _bnd(logits, lbl)
+                loss1 = loss_main + loss_bnd
+                loss1.backward(retain_graph=True)
+                
+            # 显著图与混合
+            gradient = input_img.grad.pow(2).mean(1, keepdim=True).sqrt().detach()
+            saliency = get_SBF_map(gradient, config.grid_size)
+            mixed_img = GLA_img.detach() * saliency + LLA_img * (1 - saliency)
 
-        saliency=get_SBF_map(gradient,config.grid_size)
-
-        mixed_img = GLA_img.detach() * saliency + LLA_img * (1 - saliency)
-        if visual_dict is not None:
-            visual_dict['GLA_pred']=torch.argmax(logits,1).cpu().numpy()[0]
-
-        if visual_dict is not None:
-            visual_dict['GLA_saliency']= saliency.detach().cpu().numpy()[0,0]
-
-        mixed_img = GLA_img.detach() * saliency + LLA_img * (1 - saliency)
-        if visual_dict is not None:
-            visual_dict['SBF']= mixed_img.detach().cpu().numpy()[0,0]
-            
-        if context_provider is not None:
-            ctx2 = context_provider(mixed_img)
+            # —— 2) SBF 路径
+            with torch.no_grad():
+                ctx2 = context_provider(mixed_img) if context_provider else None
             inject_global_context(model, ctx2)
-            
-        aug_var = Variable(mixed_img, requires_grad=False)  # 这里不再需要二次反传 saliency
-        if context_provider is not None:
-            ctx_sbf = context_provider(mixed_img)
-            inject_global_context(model, ctx_sbf)
 
-        aug_logits = model(aug_var)
-        aug_loss_dict = criterion.get_loss(aug_logits, lbl)
-        aug_losses = sum(aug_loss_dict[k] * criterion.weight_dict[k] for k in aug_loss_dict.keys() if k in criterion.weight_dict)
+            aug_img = mixed_img.requires_grad_(False)
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    aug_logits = model(aug_img)
+                    aug_loss_dict = criterion.get_loss(aug_logits, lbl)
+                    aug_main = sum(aug_loss_dict[k]*criterion.weight_dict[k] for k in aug_loss_dict if k in criterion.weight_dict)
+                    aug_bnd = _bnd(aug_logits, lbl)
+                    loss2 = aug_main + aug_bnd
+                scaler.scale(loss2).backward()
+                scaler.step(optimizer); scaler.update()
+            else:
+                aug_logits = model(aug_img)
+                aug_loss_dict = criterion.get_loss(aug_logits, lbl)
+                aug_main = sum(aug_loss_dict[k]*criterion.weight_dict[k] for k in aug_loss_dict if k in criterion.weight_dict)
+                aug_bnd = _bnd(aug_logits, lbl)
+                loss2 = aug_main + aug_bnd
+                loss2.backward(); optimizer.step()
 
-        if boundary_loss is not None and boundary_lambda > 0:
-            aug_loss_bnd = boundary_loss(aug_logits, lbl)
-            aug_losses = aug_losses + boundary_lambda * aug_loss_bnd
+            # 记录
+            log_dict = {k: loss_dict[k] for k in loss_dict if k in criterion.weight_dict}
+            for k in aug_loss_dict:
+                if k in criterion.weight_dict: log_dict[k + '_aug'] = aug_loss_dict[k]
+            log_dict['bnd'] = loss_bnd.detach()
+            log_dict['bnd_aug'] = aug_bnd.detach()
+            metric_logger.update(**log_dict, lr=optimizer.param_groups[0]['lr'])
 
-        aug_losses.backward()
-
-        if visual_dict is not None:
-            visual_dict['SBF_pred'] = torch.argmax(aug_logits, 1).cpu().numpy()[0]
-
-        optimizer.step()
-
-        all_loss_dict={}
-        for k in loss_dict.keys():
-            if k not in criterion.weight_dict:continue
-            all_loss_dict[k]=loss_dict[k]
-            all_loss_dict[k+'_aug']=aug_loss_dict[k]
-        if boundary_loss is not None and boundary_lambda > 0:
-            all_loss_dict['bnd'] = loss_bnd.detach()
-            all_loss_dict['bnd_aug'] = aug_loss_bnd.detach()
-        metric_logger.update(**all_loss_dict)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-
-
-        if cur_iteration>=max_iteration and max_iteration>0:
-            break
-
-        if visdir is not None and cur_iteration%visual_freq==0:
-            fs=int(len(visual_dict)**0.5)+1
-            for idx, k in enumerate(visual_dict.keys()):
-                plt.subplot(fs,fs,idx+1)
-                plt.title(k)
-                plt.axis('off')
-                if k not in ['GT','GLA_pred','SBF_pred']:
-                    plt.imshow(visual_dict[k], cmap='gray')
-                else:
-                    plt.imshow(visual_dict[k], vmin=0, vmax=4)
-            plt.tight_layout()
-            plt.savefig(f'{visdir}/{cur_iteration}.png')
-            plt.close()
-        cur_iteration+=1
+            cur_iteration += 1
+            if max_iteration > 0 and cur_iteration >= max_iteration:
+                break
+        finally:
+            clear_global_context(model)  # 每个 batch 保证清空
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return cur_iteration
-
 
 @torch.no_grad()
 def evaluate(model, criterion, data_loader, device,
@@ -252,6 +228,7 @@ def evaluate(model, criterion, data_loader, device,
         metric_logger.update(loss=float(loss.item()))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
     
 @torch.no_grad()
 def prediction_wrapper(model, test_loader, epoch, label_name, mode='base', save_prediction=False):
@@ -392,3 +369,13 @@ def eval_list_wrapper(vol_list, nclass, label_name):
 
     print("Overall mean dice by domain {:06.5f}".format( error_dict['overall_by_domain'] ) )
     return error_dict, dsc_table, domain_names
+
+def inject_global_context(module, ctx):
+    for m in module.modules():
+        if isinstance(m, FTANorm2d):
+            m.set_context(ctx)
+
+def clear_global_context(module):
+    for m in module.modules():
+        if isinstance(m, FTANorm2d):
+            m.set_context(None)

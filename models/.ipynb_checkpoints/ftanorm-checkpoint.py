@@ -31,6 +31,7 @@ class FTANorm2d(nn.Module):
         )
 
         if self.affine_fallback:
+            
             self.gamma0 = nn.Parameter(torch.ones(1, num_features, 1, 1))
             self.beta0 = nn.Parameter(torch.zeros(1, num_features, 1, 1))
         else:

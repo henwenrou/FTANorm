@@ -18,7 +18,7 @@ class FTANorm2d(nn.Module):
         self.num_features = num_features
         self.context_dim = context_dim
         self.affine_fallback = affine
-
+        self.ctx = None
         # 以 InstanceNorm 为核，不跟踪 running stats，避免域偏移。
         self.inorm = nn.InstanceNorm2d(num_features, affine=False, eps=eps, momentum=momentum, track_running_stats=False)
 
@@ -31,6 +31,7 @@ class FTANorm2d(nn.Module):
         )
 
         if self.affine_fallback:
+            
             self.gamma0 = nn.Parameter(torch.ones(1, num_features, 1, 1))
             self.beta0 = nn.Parameter(torch.zeros(1, num_features, 1, 1))
         else:
